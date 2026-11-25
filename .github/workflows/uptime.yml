@@ -1,4 +1,5 @@
 name: StoreMCP public uptime
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_failure && 'Notification test (intentional failure)' || 'Public availability check' }}
 
 on:
   schedule:
