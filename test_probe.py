@@ -1,4 +1,5 @@
 import io
+import datetime as dt
 import json
 import unittest
 from contextlib import redirect_stdout
@@ -7,6 +8,8 @@ import probe
 
 
 def healthy(url, method='GET', body=None):
+    if url.endswith('/ops-health.json'):
+        return 200, {}, json.dumps({'schema': 1, 'status': 'healthy', 'checkedAtUtc': dt.datetime.now(dt.timezone.utc).isoformat()}).encode()
     if url == probe.METADATA:
         return 200, {}, json.dumps({'resource': probe.RESOURCE, 'authorization_servers': [probe.BASE + '/shopifyapps/StoreMCPAccess/oauth']}).encode()
     if method == 'POST':
@@ -16,7 +19,17 @@ def healthy(url, method='GET', body=None):
 
 class ProbeTests(unittest.TestCase):
     def test_healthy_application_discovery_and_authentication_boundary(self):
-        self.assertEqual(len(probe.check(healthy)['checks']), 3)
+        self.assertEqual(len(probe.check(healthy)['checks']), 4)
+
+    def test_unhealthy_stale_future_and_unavailable_heartbeat_rejected(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        for code, state, checked in [(200, 'degraded', now), (503, 'healthy', now),
+            (200, 'healthy', now-dt.timedelta(minutes=6)), (200, 'healthy', now+dt.timedelta(minutes=2))]:
+            def transport(url, method='GET', body=None):
+                if url.endswith('/ops-health.json'):
+                    return code, {}, json.dumps({'schema': 1, 'status': state, 'checkedAtUtc': checked.isoformat()}).encode()
+                return healthy(url, method, body)
+            with self.assertRaises(ValueError): probe.check(transport, now)
 
     def test_proxy_success_login_redirect_wrong_resource_and_auth_failure_do_not_pass(self):
         for target, status, headers, content in [

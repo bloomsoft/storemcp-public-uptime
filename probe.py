@@ -1,5 +1,6 @@
 """Unauthenticated external StoreMCP probe; no secrets or customer data required."""
 import argparse
+import datetime as dt
 import json
 import ssl
 import urllib.error
@@ -35,7 +36,7 @@ def request(url, method='GET', body=None):
         return response.code, response.headers, content
 
 
-def check(transport=request):
+def check(transport=request, now=None):
     result = []
     status, _, body = transport(BASE + '/shopifyapps/StoreMCPAccess/')
     if status != 200 or b'StoreMCPAccess' not in body:
@@ -52,6 +53,18 @@ def check(transport=request):
             metadata.get('authorization_servers') != [BASE + '/shopifyapps/StoreMCPAccess/oauth']:
         raise ValueError('oauth_discovery_invalid')
     result.append('oauth_discovery')
+    status, _, body = transport(BASE + '/shopifyapps/StoreMCPAccess/ops-health.json')
+    try:
+        heartbeat = json.loads(body)
+        checked = dt.datetime.fromisoformat(heartbeat['checkedAtUtc'].replace('Z', '+00:00'))
+        age = ((now or dt.datetime.now(dt.timezone.utc)) - checked).total_seconds()
+        valid = status == 200 and set(heartbeat) == {'schema', 'status', 'checkedAtUtc'} and \
+            heartbeat['schema'] == 1 and heartbeat['status'] == 'healthy' and -60 <= age <= 300
+    except (ValueError, TypeError, KeyError):
+        valid = False
+    if not valid:
+        raise ValueError('private_monitor_heartbeat_unavailable')
+    result.append('private_monitor_heartbeat')
     payload = json.dumps({'jsonrpc': '2.0', 'id': 'uptime-probe', 'method': 'tools/list'}).encode()
     status, headers, _ = transport(RESOURCE, 'POST', payload)
     if status != 401 or 'Bearer' not in headers.get('WWW-Authenticate', '') or \
