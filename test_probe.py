@@ -49,6 +49,39 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(probe.main(), 1)
         self.assertNotIn('private', out.getvalue())
 
+    def test_transport_failures_identify_only_the_fixed_stage(self):
+        targets = [
+            ('web_application', lambda url, method: url.endswith('/StoreMCPAccess/')),
+            ('oauth_discovery', lambda url, method: url == probe.METADATA),
+            ('private_monitor_heartbeat', lambda url, method: url.endswith('/ops-health.json')),
+            ('mcp_authentication_boundary', lambda url, method: method == 'POST'),
+        ]
+        for stage, selected in targets:
+            def transport(url, method='GET', body=None):
+                if selected(url, method):
+                    raise RuntimeError('private-token https://secret.invalid/?token=private')
+                return healthy(url, method, body)
+            with self.subTest(stage=stage):
+                with self.assertRaises(probe.ProbeFailure) as caught:
+                    probe.check(transport)
+                self.assertEqual(caught.exception.category, stage + '_transport_failure')
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_main_prints_known_categories_but_no_remote_details(self):
+        for error, expected in [
+            (probe.ProbeFailure('private_monitor_heartbeat_unavailable'), 'private_monitor_heartbeat_unavailable'),
+            (probe.ProbeFailure('private-token'), 'unexpected_probe_failure'),
+            (RuntimeError('private-token https://secret.invalid'), 'unexpected_probe_failure'),
+        ]:
+            out = io.StringIO()
+            with patch('sys.argv', ['probe']), patch.object(probe, 'check', side_effect=error), redirect_stdout(out):
+                self.assertEqual(probe.main(), 1)
+            result = json.loads(out.getvalue())
+            self.assertEqual(result['failure_category'], expected)
+            self.assertNotIn('private-token', out.getvalue())
+            self.assertNotIn('secret.invalid', out.getvalue())
+
     def test_notification_test_does_not_contact_or_stop_application(self):
         with patch('sys.argv', ['probe', '--simulate-failure']), patch.object(probe, 'check') as check, redirect_stdout(io.StringIO()):
             self.assertEqual(probe.main(), 1)

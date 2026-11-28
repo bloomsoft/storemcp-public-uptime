@@ -12,6 +12,29 @@ METADATA = BASE + '/.well-known/oauth-protected-resource/shopifyapps/StoreMCPAcc
 LIMIT = 65536
 
 
+FAILURE_CATEGORIES = frozenset({
+    'web_application_unavailable', 'oauth_discovery_unavailable',
+    'oauth_discovery_invalid', 'private_monitor_heartbeat_unavailable',
+    'mcp_authentication_boundary_unavailable', 'web_application_transport_failure',
+    'oauth_discovery_transport_failure', 'private_monitor_heartbeat_transport_failure',
+    'mcp_authentication_boundary_transport_failure', 'unexpected_probe_failure',
+})
+
+
+class ProbeFailure(ValueError):
+    def __init__(self, category):
+        self.category = category if category in FAILURE_CATEGORIES else 'unexpected_probe_failure'
+        super().__init__(self.category)
+
+
+def checked_request(transport, stage, url, method='GET', body=None):
+    try:
+        return transport(url, method, body)
+    except Exception:
+        # Never preserve a provider exception or its URL/headers/body.
+        raise ProbeFailure(stage + '_transport_failure') from None
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -38,22 +61,22 @@ def request(url, method='GET', body=None):
 
 def check(transport=request, now=None):
     result = []
-    status, _, body = transport(BASE + '/shopifyapps/StoreMCPAccess/')
+    status, _, body = checked_request(transport, 'web_application', BASE + '/shopifyapps/StoreMCPAccess/')
     if status != 200 or b'StoreMCPAccess' not in body:
-        raise ValueError('web_application_unavailable')
+        raise ProbeFailure('web_application_unavailable')
     result.append('web_application')
-    status, _, body = transport(METADATA)
+    status, _, body = checked_request(transport, 'oauth_discovery', METADATA)
     if status != 200:
-        raise ValueError('oauth_discovery_unavailable')
+        raise ProbeFailure('oauth_discovery_unavailable')
     try:
         metadata = json.loads(body)
     except (ValueError, UnicodeError):
-        raise ValueError('oauth_discovery_invalid') from None
+        raise ProbeFailure('oauth_discovery_invalid') from None
     if not isinstance(metadata, dict) or metadata.get('resource') != RESOURCE or \
             metadata.get('authorization_servers') != [BASE + '/shopifyapps/StoreMCPAccess/oauth']:
-        raise ValueError('oauth_discovery_invalid')
+        raise ProbeFailure('oauth_discovery_invalid')
     result.append('oauth_discovery')
-    status, _, body = transport(BASE + '/shopifyapps/StoreMCPAccess/ops-health.json')
+    status, _, body = checked_request(transport, 'private_monitor_heartbeat', BASE + '/shopifyapps/StoreMCPAccess/ops-health.json')
     try:
         heartbeat = json.loads(body)
         checked = dt.datetime.fromisoformat(heartbeat['checkedAtUtc'].replace('Z', '+00:00'))
@@ -63,13 +86,13 @@ def check(transport=request, now=None):
     except (ValueError, TypeError, KeyError):
         valid = False
     if not valid:
-        raise ValueError('private_monitor_heartbeat_unavailable')
+        raise ProbeFailure('private_monitor_heartbeat_unavailable')
     result.append('private_monitor_heartbeat')
     payload = json.dumps({'jsonrpc': '2.0', 'id': 'uptime-probe', 'method': 'tools/list'}).encode()
-    status, headers, _ = transport(RESOURCE, 'POST', payload)
+    status, headers, _ = checked_request(transport, 'mcp_authentication_boundary', RESOURCE, 'POST', payload)
     if status != 401 or 'Bearer' not in headers.get('WWW-Authenticate', '') or \
             METADATA not in headers.get('WWW-Authenticate', ''):
-        raise ValueError('mcp_authentication_boundary_unavailable')
+        raise ProbeFailure('mcp_authentication_boundary_unavailable')
     result.append('mcp_authentication_boundary')
     return {'status': 'healthy', 'checks': result, 'shopify_tools_executed': False}
 
@@ -84,9 +107,10 @@ def main():
             return 1
         print(json.dumps(check()))
         return 0
-    except Exception:
-        # Never print response bodies, headers, URLs from exceptions or remote text.
-        print(json.dumps({'status': 'external_probe_failed', 'application_changed': False}))
+    except Exception as error:
+        # Only fixed categories escape; never remote text, bodies, headers or URLs.
+        category = error.category if isinstance(error, ProbeFailure) and error.category in FAILURE_CATEGORIES else 'unexpected_probe_failure'
+        print(json.dumps({'status': 'external_probe_failed', 'failure_category': category, 'application_changed': False}))
         return 1
 
 
